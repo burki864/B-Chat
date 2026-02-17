@@ -2,13 +2,22 @@
 import { GoogleGenAI } from "@google/genai";
 
 export class GeminiService {
-  private ai: GoogleGenAI;
+  private ai: GoogleGenAI | null = null;
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+    const apiKey = process.env.API_KEY;
+    if (apiKey && apiKey !== 'undefined') {
+      try {
+        this.ai = new GoogleGenAI({ apiKey });
+      } catch (e) {
+        console.error("Gemini init failed:", e);
+      }
+    }
   }
 
   async generateReply(chatHistory: { sender: string; text: string }[], botName: string) {
+    if (!this.ai) return "AI is not configured (missing API Key).";
+
     const prompt = `
       You are participating in a group chat as ${botName}. 
       Context of the conversation:

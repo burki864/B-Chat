@@ -16,15 +16,21 @@ const App: React.FC = () => {
 
   // Sync data on boot and user change
   useEffect(() => {
-    const savedUser = localStorage.getItem('pulse_user_v2');
-    if (savedUser) {
-      setUser(JSON.parse(savedUser));
+    try {
+      const savedUser = localStorage.getItem('pulse_user_v2');
+      if (savedUser && savedUser !== 'undefined') {
+        setUser(JSON.parse(savedUser));
+      }
+    } catch (e) {
+      console.error("Failed to parse saved user:", e);
+      localStorage.removeItem('pulse_user_v2');
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, []);
 
   const fetchData = useCallback(async () => {
-    if (!user || !isSupabaseConfigured) return;
+    if (!user || !isSupabaseConfigured || !supabase) return;
 
     try {
       // Fetch all users
@@ -65,42 +71,51 @@ const App: React.FC = () => {
 
   // Real-time subscriptions
   useEffect(() => {
-    if (!user || !isSupabaseConfigured) return;
+    if (!user || !isSupabaseConfigured || !supabase) return;
 
-    const channel = supabase
-      .channel('schema-db-changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
-        fetchData();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'conversation_participants' }, () => {
-        fetchData();
-      })
-      .subscribe();
+    try {
+      const channel = supabase
+        .channel('schema-db-changes')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
+          fetchData();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'conversation_participants' }, () => {
+          fetchData();
+        })
+        .subscribe();
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    } catch (e) {
+      console.error("Subscription error:", e);
+    }
   }, [user, fetchData]);
 
   const handleLogin = async (name: string) => {
-    if (!isSupabaseConfigured) return;
+    if (!isSupabaseConfigured || !supabase) return;
     const id = `usr-${Math.random().toString(36).substr(2, 5)}`;
     const avatar_url = `https://picsum.photos/seed/${name}/200`;
     const newUser = { id, name, avatar_url };
 
-    const { error } = await supabase.from('users').insert([newUser]);
-    if (!error) {
-      setUser(newUser);
-      localStorage.setItem('pulse_user_v2', JSON.stringify(newUser));
-    } else {
-      console.error("Login error:", error);
+    try {
+      const { error } = await supabase.from('users').insert([newUser]);
+      if (!error) {
+        setUser(newUser);
+        localStorage.setItem('pulse_user_v2', JSON.stringify(newUser));
+      } else {
+        console.error("Login DB error:", error);
+        // Still allow login for UI purposes if table doesn't exist yet, but warned
+        setUser(newUser);
+      }
+    } catch (e) {
+      console.error("Login catch error:", e);
     }
   };
 
   const createDM = async (targetUserId: string) => {
-    if (!user || !isSupabaseConfigured) return;
+    if (!user || !isSupabaseConfigured || !supabase) return;
     
-    // Check if DM already exists
     const existing = conversations.find(c => 
       c.type === 'dm' && c.participants?.some(p => p.user_id === targetUserId)
     );
@@ -108,142 +123,151 @@ const App: React.FC = () => {
     if (existing) {
       setActiveConvId(existing.id);
     } else {
-      // Ensure target user exists in DB if it was a manual ID entry
-      const { data: targetUser } = await supabase.from('users').select('*').eq('id', targetUserId).single();
-      if (!targetUser) {
-        // Create a ghost user for valid ID entry if not exists
-        await supabase.from('users').insert([{ 
-          id: targetUserId, 
-          name: `User ${targetUserId}`, 
-          avatar_url: `https://picsum.photos/seed/${targetUserId}/200` 
-        }]);
-      }
+      try {
+        const { data: targetUser } = await supabase.from('users').select('*').eq('id', targetUserId).single();
+        if (!targetUser) {
+          await supabase.from('users').insert([{ 
+            id: targetUserId, 
+            name: `User ${targetUserId}`, 
+            avatar_url: `https://picsum.photos/seed/${targetUserId}/200` 
+          }]);
+        }
 
-      const { data: conv } = await supabase
-        .from('conversations')
-        .insert([{ type: 'dm' }])
-        .select()
-        .single();
+        const { data: conv } = await supabase
+          .from('conversations')
+          .insert([{ type: 'dm' }])
+          .select()
+          .single();
 
-      if (conv) {
-        await supabase.from('conversation_participants').insert([
-          { conversation_id: conv.id, user_id: user.id, status: 'joined' },
-          { conversation_id: conv.id, user_id: targetUserId, status: 'joined' }
-        ]);
-        setActiveConvId(conv.id);
-        fetchData();
-      }
+        if (conv) {
+          await supabase.from('conversation_participants').insert([
+            { conversation_id: conv.id, user_id: user.id, status: 'joined' },
+            { conversation_id: conv.id, user_id: targetUserId, status: 'joined' }
+          ]);
+          setActiveConvId(conv.id);
+          fetchData();
+        }
+      } catch (e) { console.error(e); }
     }
     setShowAddModal(null);
   };
 
   const createGroup = async (name: string) => {
-    if (!user || !isSupabaseConfigured) return;
-    const { data: conv } = await supabase
-      .from('conversations')
-      .insert([{ type: 'group', name }])
-      .select()
-      .single();
+    if (!user || !isSupabaseConfigured || !supabase) return;
+    try {
+      const { data: conv } = await supabase
+        .from('conversations')
+        .insert([{ type: 'group', name }])
+        .select()
+        .single();
 
-    if (conv) {
-      await supabase.from('conversation_participants').insert([
-        { conversation_id: conv.id, user_id: user.id, is_admin: true, status: 'joined' }
-      ]);
-      setActiveConvId(conv.id);
-      fetchData();
-    }
+      if (conv) {
+        await supabase.from('conversation_participants').insert([
+          { conversation_id: conv.id, user_id: user.id, is_admin: true, status: 'joined' }
+        ]);
+        setActiveConvId(conv.id);
+        fetchData();
+      }
+    } catch (e) { console.error(e); }
     setShowAddModal(null);
   };
 
   const requestJoinGroup = async (groupId: string) => {
-    if (!user || !isSupabaseConfigured) return;
-    await supabase.from('conversation_participants').insert([
-      { conversation_id: groupId, user_id: user.id, status: 'pending' }
-    ]);
-    fetchData();
+    if (!user || !isSupabaseConfigured || !supabase) return;
+    try {
+      await supabase.from('conversation_participants').insert([
+        { conversation_id: groupId, user_id: user.id, status: 'pending' }
+      ]);
+      fetchData();
+    } catch (e) { console.error(e); }
   };
 
   const handleRequest = async (groupId: string, requesterId: string, accept: boolean) => {
-    if (!isSupabaseConfigured) return;
-    if (accept) {
-      await supabase
-        .from('conversation_participants')
-        .update({ status: 'joined' })
-        .match({ conversation_id: groupId, user_id: requesterId });
-    } else {
-      await supabase
-        .from('conversation_participants')
-        .delete()
-        .match({ conversation_id: groupId, user_id: requesterId });
-    }
-    fetchData();
+    if (!isSupabaseConfigured || !supabase) return;
+    try {
+      if (accept) {
+        await supabase
+          .from('conversation_participants')
+          .update({ status: 'joined' })
+          .match({ conversation_id: groupId, user_id: requesterId });
+      } else {
+        await supabase
+          .from('conversation_participants')
+          .delete()
+          .match({ conversation_id: groupId, user_id: requesterId });
+      }
+      fetchData();
+    } catch (e) { console.error(e); }
   };
 
   const sendMessage = async (text: string) => {
-    if (!activeConvId || !user || !isSupabaseConfigured) return;
+    if (!activeConvId || !user || !isSupabaseConfigured || !supabase) return;
     
-    const { error } = await supabase.from('messages').insert([{
-      conversation_id: activeConvId,
-      sender_id: user.id,
-      text
-    }]);
+    try {
+      const { error } = await supabase.from('messages').insert([{
+        conversation_id: activeConvId,
+        sender_id: user.id,
+        text
+      }]);
 
-    if (!error) {
-      await supabase.from('conversations').update({ last_active: new Date().toISOString() }).match({ id: activeConvId });
-      
-      const conv = conversations.find(c => c.id === activeConvId);
-      if (conv && (conv.participants?.some(p => p.user_id === 'usr-001') || conv.type === 'group')) {
-         triggerAi(conv, text);
+      if (!error) {
+        await supabase.from('conversations').update({ last_active: new Date().toISOString() }).match({ id: activeConvId });
+        const conv = conversations.find(c => c.id === activeConvId);
+        if (conv && (conv.participants?.some(p => p.user_id === 'usr-001') || conv.type === 'group')) {
+           triggerAi(conv, text);
+        }
       }
-    }
+    } catch (e) { console.error(e); }
   };
 
   const triggerAi = async (conv: Conversation, lastMsg: string) => {
-    if (!isSupabaseConfigured) return;
-    const { data: msgs } = await supabase
-      .from('messages')
-      .select('text, sender:users(name)')
-      .eq('conversation_id', conv.id)
-      .order('created_at', { ascending: false })
-      .limit(5);
+    if (!isSupabaseConfigured || !supabase) return;
+    try {
+      const { data: msgs } = await supabase
+        .from('messages')
+        .select('text, sender:users(name)')
+        .eq('conversation_id', conv.id)
+        .order('created_at', { ascending: false })
+        .limit(5);
 
-    if (msgs) {
-      const history = msgs.reverse().map((m: any) => ({
-        sender: m.sender?.name || 'User',
-        text: m.text
-      }));
-      const reply = await gemini.generateReply(history, "Assistant");
-      await supabase.from('messages').insert([{
-        conversation_id: conv.id,
-        sender_id: 'usr-001',
-        text: reply,
-        is_ai: true
-      }]);
-    }
+      if (msgs) {
+        const history = msgs.reverse().map((m: any) => ({
+          sender: m.sender?.name || 'User',
+          text: m.text
+        }));
+        const reply = await gemini.generateReply(history, "Assistant");
+        await supabase.from('messages').insert([{
+          conversation_id: conv.id,
+          sender_id: 'usr-001',
+          text: reply,
+          is_ai: true
+        }]);
+      }
+    } catch (e) { console.error(e); }
   };
 
   if (!isSupabaseConfigured) {
     return (
       <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6 text-center">
         <div className="bg-white rounded-3xl p-10 max-w-lg shadow-2xl">
-          <div className="w-20 h-20 bg-red-100 rounded-2xl flex items-center justify-center mx-auto mb-6 text-red-600">
-            <ICONS.X className="w-10 h-10" />
+          <div className="w-20 h-20 bg-amber-100 rounded-2xl flex items-center justify-center mx-auto mb-6 text-amber-600">
+            <ICONS.Plus className="w-10 h-10 rotate-45" />
           </div>
-          <h2 className="text-2xl font-bold text-slate-800 mb-4">Configuration Required</h2>
+          <h2 className="text-2xl font-bold text-slate-800 mb-4">Configuration Missing</h2>
           <p className="text-slate-500 mb-6 leading-relaxed">
-            Please ensure that <strong>SUPABASE_URL</strong> and <strong>SUPABASE_ANON_KEY</strong> 
-            environment variables are set in your environment.
+            Please set <strong>SUPABASE_URL</strong> and <strong>SUPABASE_ANON_KEY</strong> 
+            to enable cloud persistence and real-time messaging.
           </p>
-          <div className="p-4 bg-slate-50 rounded-xl text-left font-mono text-sm text-slate-600 space-y-2">
-            <div>SUPABASE_URL=https://your-project.supabase.co</div>
-            <div>SUPABASE_ANON_KEY=your-anon-key</div>
+          <div className="p-4 bg-slate-50 rounded-xl text-left font-mono text-sm text-slate-600 space-y-2 overflow-x-auto">
+            <div>SUPABASE_URL=https://your-id.supabase.co</div>
+            <div>SUPABASE_ANON_KEY=eyJ...</div>
           </div>
         </div>
       </div>
     );
   }
 
-  if (loading) return <div className="h-screen flex items-center justify-center font-bold text-slate-400">Loading Pulse...</div>;
+  if (loading) return <div className="h-screen flex items-center justify-center font-bold text-slate-400">Initializing Pulse...</div>;
   if (!user) return <Login onLogin={handleLogin} />;
 
   const activeConv = conversations.find(c => c.id === activeConvId);
@@ -254,7 +278,7 @@ const App: React.FC = () => {
         <div className="p-6 border-b border-slate-800 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-lg">G</div>
-            <h1 className="font-bold text-xl tracking-tight">Gemini Pulse</h1>
+            <h1 className="font-bold text-xl tracking-tight">B-Chat</h1>
           </div>
         </div>
 
@@ -334,10 +358,12 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
   const [messages, setMessages] = useState<Message[]>([]);
   
   useEffect(() => {
-    if (!isSupabaseConfigured) return;
+    if (!isSupabaseConfigured || !supabase) return;
     const loadMessages = async () => {
-      const { data } = await supabase.from('messages').select('*').eq('conversation_id', conversation.id).order('created_at', { ascending: true });
-      if (data) setMessages(data);
+      try {
+        const { data } = await supabase.from('messages').select('*').eq('conversation_id', conversation.id).order('created_at', { ascending: true });
+        if (data) setMessages(data);
+      } catch (e) { console.error(e); }
     };
     loadMessages();
 
@@ -353,9 +379,10 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
     return () => { supabase.removeChannel(channel); };
   }, [conversation.id]);
 
-  const pending = (conversation.participants || []).filter(p => p.status === 'pending');
-  const isAdmin = (conversation.participants || []).find(p => p.user_id === user.id)?.is_admin;
-  const otherParticipant = conversation.type === 'dm' ? conversation.participants?.find(p => p.user_id !== user.id) : null;
+  const participants = conversation.participants || [];
+  const pending = participants.filter(p => p.status === 'pending');
+  const isAdmin = participants.find(p => p.user_id === user.id)?.is_admin;
+  const otherParticipant = conversation.type === 'dm' ? participants.find(p => p.user_id !== user.id) : null;
   const displayName = conversation.type === 'dm' ? (otherParticipant?.user?.name || `User ${otherParticipant?.user_id}`) : conversation.name;
 
   return (
