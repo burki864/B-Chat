@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { User, Conversation, Message, Participant } from './types';
 import { ICONS } from './constants';
 import { gemini } from './services/geminiService';
@@ -14,131 +14,141 @@ const App: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState<'dm' | 'group' | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Sync data on boot and user change
+  // Demo Mode State (Fallback when Supabase is missing)
+  const isDemo = !isSupabaseConfigured;
+
+  // Sync data on boot
   useEffect(() => {
     try {
-      const savedUser = localStorage.getItem('pulse_user_v2');
+      const storageKey = isDemo ? 'pulse_demo_user' : 'pulse_user_v2';
+      const savedUser = localStorage.getItem(storageKey);
       if (savedUser && savedUser !== 'undefined') {
         setUser(JSON.parse(savedUser));
       }
     } catch (e) {
       console.error("Failed to parse saved user:", e);
-      localStorage.removeItem('pulse_user_v2');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isDemo]);
 
   const fetchData = useCallback(async () => {
-    if (!user || !isSupabaseConfigured || !supabase) return;
+    if (!user) return;
 
-    try {
-      // Fetch all users
-      const { data: users } = await supabase.from('users').select('*');
-      if (users) setAllUsers(users);
-
-      // Fetch user's conversations
-      const { data: convs } = await supabase
-        .from('conversations')
-        .select(`
-          *,
-          participants:conversation_participants(
-            user_id,
-            is_admin,
-            status,
-            user:users(*)
-          )
-        `)
-        .order('last_active', { ascending: false });
-
-      if (convs) {
-        // Filter only convs where user is a participant
-        const myConvs = convs.filter(c => 
-          c.participants?.some((p: any) => p.user_id === user.id && p.status === 'joined')
-        );
-        setConversations(myConvs as any);
+    if (isDemo) {
+      // Demo Logic: Load from Local Storage
+      const localUsers = JSON.parse(localStorage.getItem('pulse_demo_all_users') || '[]');
+      const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+      
+      // Ensure AI Assistant exists in demo
+      const aiUser: User = { id: 'usr-001', name: 'Gemini Assistant', avatar_url: 'https://picsum.photos/seed/ai/200' };
+      if (!localUsers.find((u: User) => u.id === aiUser.id)) {
+        localUsers.push(aiUser);
       }
-    } catch (err) {
-      console.error("Error fetching data:", err);
+      
+      setAllUsers(localUsers);
+      setConversations(localConvs.filter((c: Conversation) => 
+        c.participants?.some(p => p.user_id === user.id && p.status === 'joined')
+      ));
+    } else if (supabase) {
+      // Real Logic: Load from Supabase
+      try {
+        const { data: users } = await supabase.from('users').select('*');
+        if (users) setAllUsers(users);
+
+        const { data: convs } = await supabase
+          .from('conversations')
+          .select(`
+            *,
+            participants:conversation_participants(
+              user_id,
+              is_admin,
+              status,
+              user:users(*)
+            )
+          `)
+          .order('last_active', { ascending: false });
+
+        if (convs) {
+          const myConvs = convs.filter(c => 
+            c.participants?.some((p: any) => p.user_id === user.id && p.status === 'joined')
+          );
+          setConversations(myConvs as any);
+        }
+      } catch (err) {
+        console.error("Error fetching data:", err);
+      }
     }
-  }, [user]);
+  }, [user, isDemo]);
 
   useEffect(() => {
-    if (isSupabaseConfigured) {
-      fetchData();
-    }
+    fetchData();
   }, [fetchData]);
 
-  // Real-time subscriptions
+  // Real-time subscriptions (Only for real mode)
   useEffect(() => {
-    if (!user || !isSupabaseConfigured || !supabase) return;
+    if (!user || isDemo || !supabase) return;
 
     try {
       const channel = supabase
         .channel('schema-db-changes')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
-          fetchData();
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'conversation_participants' }, () => {
-          fetchData();
-        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => fetchData())
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'conversation_participants' }, () => fetchData())
         .subscribe();
 
-      return () => {
-        supabase.removeChannel(channel);
-      };
-    } catch (e) {
-      console.error("Subscription error:", e);
-    }
-  }, [user, fetchData]);
+      return () => { supabase.removeChannel(channel); };
+    } catch (e) { console.error("Subscription error:", e); }
+  }, [user, fetchData, isDemo]);
 
   const handleLogin = async (name: string) => {
-    if (!isSupabaseConfigured || !supabase) return;
     const id = `usr-${Math.random().toString(36).substr(2, 5)}`;
     const avatar_url = `https://picsum.photos/seed/${name}/200`;
     const newUser = { id, name, avatar_url };
 
-    try {
+    if (isDemo) {
+      const localUsers = JSON.parse(localStorage.getItem('pulse_demo_all_users') || '[]');
+      localUsers.push(newUser);
+      localStorage.setItem('pulse_demo_all_users', JSON.stringify(localUsers));
+      localStorage.setItem('pulse_demo_user', JSON.stringify(newUser));
+      setUser(newUser);
+      fetchData();
+    } else if (supabase) {
       const { error } = await supabase.from('users').insert([newUser]);
       if (!error) {
         setUser(newUser);
         localStorage.setItem('pulse_user_v2', JSON.stringify(newUser));
-      } else {
-        console.error("Login DB error:", error);
-        // Still allow login for UI purposes if table doesn't exist yet, but warned
-        setUser(newUser);
       }
-    } catch (e) {
-      console.error("Login catch error:", e);
     }
   };
 
   const createDM = async (targetUserId: string) => {
-    if (!user || !isSupabaseConfigured || !supabase) return;
+    if (!user) return;
     
-    const existing = conversations.find(c => 
-      c.type === 'dm' && c.participants?.some(p => p.user_id === targetUserId)
-    );
+    if (isDemo) {
+      const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+      let conv = localConvs.find((c: Conversation) => 
+        c.type === 'dm' && c.participants?.some(p => p.user_id === targetUserId)
+      );
 
-    if (existing) {
-      setActiveConvId(existing.id);
-    } else {
+      if (!conv) {
+        conv = {
+          id: `conv-${Date.now()}`,
+          type: 'dm',
+          last_active: new Date().toISOString(),
+          participants: [
+            { user_id: user.id, is_admin: false, status: 'joined', user },
+            { user_id: targetUserId, is_admin: false, status: 'joined', user: allUsers.find(u => u.id === targetUserId) }
+          ],
+          messages: []
+        };
+        localConvs.push(conv);
+        localStorage.setItem('pulse_demo_conversations', JSON.stringify(localConvs));
+      }
+      setActiveConvId(conv.id);
+      fetchData();
+    } else if (supabase) {
       try {
-        const { data: targetUser } = await supabase.from('users').select('*').eq('id', targetUserId).single();
-        if (!targetUser) {
-          await supabase.from('users').insert([{ 
-            id: targetUserId, 
-            name: `User ${targetUserId}`, 
-            avatar_url: `https://picsum.photos/seed/${targetUserId}/200` 
-          }]);
-        }
-
-        const { data: conv } = await supabase
-          .from('conversations')
-          .insert([{ type: 'dm' }])
-          .select()
-          .single();
-
+        const { data: conv } = await supabase.from('conversations').insert([{ type: 'dm' }]).select().single();
         if (conv) {
           await supabase.from('conversation_participants').insert([
             { conversation_id: conv.id, user_id: user.id, status: 'joined' },
@@ -153,122 +163,148 @@ const App: React.FC = () => {
   };
 
   const createGroup = async (name: string) => {
-    if (!user || !isSupabaseConfigured || !supabase) return;
-    try {
-      const { data: conv } = await supabase
-        .from('conversations')
-        .insert([{ type: 'group', name }])
-        .select()
-        .single();
-
-      if (conv) {
-        await supabase.from('conversation_participants').insert([
-          { conversation_id: conv.id, user_id: user.id, is_admin: true, status: 'joined' }
-        ]);
-        setActiveConvId(conv.id);
-        fetchData();
-      }
-    } catch (e) { console.error(e); }
+    if (!user) return;
+    if (isDemo) {
+      const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+      const conv: Conversation = {
+        id: `group-${Date.now()}`,
+        type: 'group',
+        name,
+        last_active: new Date().toISOString(),
+        participants: [{ user_id: user.id, is_admin: true, status: 'joined', user }],
+        messages: []
+      };
+      localConvs.push(conv);
+      localStorage.setItem('pulse_demo_conversations', JSON.stringify(localConvs));
+      setActiveConvId(conv.id);
+      fetchData();
+    } else if (supabase) {
+      try {
+        const { data: conv } = await supabase.from('conversations').insert([{ type: 'group', name }]).select().single();
+        if (conv) {
+          await supabase.from('conversation_participants').insert([
+            { conversation_id: conv.id, user_id: user.id, is_admin: true, status: 'joined' }
+          ]);
+          setActiveConvId(conv.id);
+          fetchData();
+        }
+      } catch (e) { console.error(e); }
+    }
     setShowAddModal(null);
   };
 
   const requestJoinGroup = async (groupId: string) => {
-    if (!user || !isSupabaseConfigured || !supabase) return;
-    try {
-      await supabase.from('conversation_participants').insert([
-        { conversation_id: groupId, user_id: user.id, status: 'pending' }
-      ]);
+    if (!user) return;
+    if (isDemo) {
+      const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+      const conv = localConvs.find((c: Conversation) => c.id === groupId);
+      if (conv) {
+        conv.participants.push({ user_id: user.id, is_admin: false, status: 'pending', user });
+        localStorage.setItem('pulse_demo_conversations', JSON.stringify(localConvs));
+        fetchData();
+      }
+    } else if (supabase) {
+      await supabase.from('conversation_participants').insert([{ conversation_id: groupId, user_id: user.id, status: 'pending' }]);
       fetchData();
-    } catch (e) { console.error(e); }
+    }
   };
 
   const handleRequest = async (groupId: string, requesterId: string, accept: boolean) => {
-    if (!isSupabaseConfigured || !supabase) return;
-    try {
+    if (isDemo) {
+      const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+      const conv = localConvs.find((c: Conversation) => c.id === groupId);
+      if (conv) {
+        if (accept) {
+          const p = conv.participants.find((p: any) => p.user_id === requesterId);
+          if (p) p.status = 'joined';
+        } else {
+          conv.participants = conv.participants.filter((p: any) => p.user_id !== requesterId);
+        }
+        localStorage.setItem('pulse_demo_conversations', JSON.stringify(localConvs));
+        fetchData();
+      }
+    } else if (supabase) {
       if (accept) {
-        await supabase
-          .from('conversation_participants')
-          .update({ status: 'joined' })
-          .match({ conversation_id: groupId, user_id: requesterId });
+        await supabase.from('conversation_participants').update({ status: 'joined' }).match({ conversation_id: groupId, user_id: requesterId });
       } else {
-        await supabase
-          .from('conversation_participants')
-          .delete()
-          .match({ conversation_id: groupId, user_id: requesterId });
+        await supabase.from('conversation_participants').delete().match({ conversation_id: groupId, user_id: requesterId });
       }
       fetchData();
-    } catch (e) { console.error(e); }
+    }
   };
 
   const sendMessage = async (text: string) => {
-    if (!activeConvId || !user || !isSupabaseConfigured || !supabase) return;
+    if (!activeConvId || !user) return;
     
-    try {
-      const { error } = await supabase.from('messages').insert([{
-        conversation_id: activeConvId,
-        sender_id: user.id,
-        text
-      }]);
-
+    if (isDemo) {
+      const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+      const conv = localConvs.find((c: Conversation) => c.id === activeConvId);
+      if (conv) {
+        const msg: Message = {
+          id: `msg-${Date.now()}`,
+          conversation_id: activeConvId,
+          sender_id: user.id,
+          text,
+          is_ai: false,
+          created_at: new Date().toISOString()
+        };
+        conv.messages = conv.messages || [];
+        conv.messages.push(msg);
+        conv.last_active = new Date().toISOString();
+        localStorage.setItem('pulse_demo_conversations', JSON.stringify(localConvs));
+        fetchData();
+        
+        if (conv.participants?.some(p => p.user_id === 'usr-001') || conv.type === 'group') {
+          triggerAiDemo(conv);
+        }
+      }
+    } else if (supabase) {
+      const { error } = await supabase.from('messages').insert([{ conversation_id: activeConvId, sender_id: user.id, text }]);
       if (!error) {
         await supabase.from('conversations').update({ last_active: new Date().toISOString() }).match({ id: activeConvId });
         const conv = conversations.find(c => c.id === activeConvId);
         if (conv && (conv.participants?.some(p => p.user_id === 'usr-001') || conv.type === 'group')) {
-           triggerAi(conv, text);
+           triggerAiReal(conv);
         }
       }
-    } catch (e) { console.error(e); }
+    }
   };
 
-  const triggerAi = async (conv: Conversation, lastMsg: string) => {
-    if (!isSupabaseConfigured || !supabase) return;
-    try {
-      const { data: msgs } = await supabase
-        .from('messages')
-        .select('text, sender:users(name)')
-        .eq('conversation_id', conv.id)
-        .order('created_at', { ascending: false })
-        .limit(5);
-
-      if (msgs) {
-        const history = msgs.reverse().map((m: any) => ({
-          sender: m.sender?.name || 'User',
-          text: m.text
-        }));
-        const reply = await gemini.generateReply(history, "Assistant");
-        await supabase.from('messages').insert([{
-          conversation_id: conv.id,
-          sender_id: 'usr-001',
-          text: reply,
-          is_ai: true
-        }]);
-      }
-    } catch (e) { console.error(e); }
+  const triggerAiDemo = async (conv: Conversation) => {
+    const history = (conv.messages || []).slice(-5).map(m => ({
+      sender: allUsers.find(u => u.id === m.sender_id)?.name || 'User',
+      text: m.text
+    }));
+    const reply = await gemini.generateReply(history, "Assistant");
+    
+    const localConvs = JSON.parse(localStorage.getItem('pulse_demo_conversations') || '[]');
+    const targetConv = localConvs.find((c: Conversation) => c.id === conv.id);
+    if (targetConv) {
+      targetConv.messages.push({
+        id: `msg-ai-${Date.now()}`,
+        conversation_id: conv.id,
+        sender_id: 'usr-001',
+        text: reply,
+        is_ai: true,
+        created_at: new Date().toISOString()
+      });
+      localStorage.setItem('pulse_demo_conversations', JSON.stringify(localConvs));
+      fetchData();
+    }
   };
 
-  if (!isSupabaseConfigured) {
-    return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6 text-center">
-        <div className="bg-white rounded-3xl p-10 max-w-lg shadow-2xl">
-          <div className="w-20 h-20 bg-amber-100 rounded-2xl flex items-center justify-center mx-auto mb-6 text-amber-600">
-            <ICONS.Plus className="w-10 h-10 rotate-45" />
-          </div>
-          <h2 className="text-2xl font-bold text-slate-800 mb-4">Configuration Missing</h2>
-          <p className="text-slate-500 mb-6 leading-relaxed">
-            Please set <strong>SUPABASE_URL</strong> and <strong>SUPABASE_ANON_KEY</strong> 
-            to enable cloud persistence and real-time messaging.
-          </p>
-          <div className="p-4 bg-slate-50 rounded-xl text-left font-mono text-sm text-slate-600 space-y-2 overflow-x-auto">
-            <div>SUPABASE_URL=https://your-id.supabase.co</div>
-            <div>SUPABASE_ANON_KEY=eyJ...</div>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const triggerAiReal = async (conv: Conversation) => {
+    if (!supabase) return;
+    const { data: msgs } = await supabase.from('messages').select('text, sender:users(name)').eq('conversation_id', conv.id).order('created_at', { ascending: false }).limit(5);
+    if (msgs) {
+      const history = msgs.reverse().map((m: any) => ({ sender: m.sender?.name || 'User', text: m.text }));
+      const reply = await gemini.generateReply(history, "Assistant");
+      await supabase.from('messages').insert([{ conversation_id: conv.id, sender_id: 'usr-001', text: reply, is_ai: true }]);
+    }
+  };
 
-  if (loading) return <div className="h-screen flex items-center justify-center font-bold text-slate-400">Initializing Pulse...</div>;
-  if (!user) return <Login onLogin={handleLogin} />;
+  if (loading) return <div className="h-screen flex items-center justify-center font-bold text-slate-400">Initializing...</div>;
+  if (!user) return <Login onLogin={handleLogin} isDemo={isDemo} />;
 
   const activeConv = conversations.find(c => c.id === activeConvId);
 
@@ -280,6 +316,7 @@ const App: React.FC = () => {
             <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-lg">G</div>
             <h1 className="font-bold text-xl tracking-tight">B-Chat</h1>
           </div>
+          {isDemo && <span className="text-[10px] bg-amber-500/20 text-amber-500 px-2 py-1 rounded-full font-bold uppercase">Demo</span>}
         </div>
 
         <div className="p-4 flex-1 overflow-y-auto space-y-6">
@@ -318,7 +355,7 @@ const App: React.FC = () => {
                     <div className="text-left flex-1 min-w-0">
                       <p className="font-semibold truncate">{displayName}</p>
                       <p className="text-[10px] truncate opacity-60 uppercase tracking-tighter">
-                        {conv.type === 'dm' ? 'Direct Message' : 'Workspace Group'}
+                        {conv.type === 'dm' ? 'Direct Message' : 'Group'}
                       </p>
                     </div>
                   </button>
@@ -336,6 +373,8 @@ const App: React.FC = () => {
             conversation={activeConv} 
             onSendMessage={sendMessage} 
             onHandleRequest={handleRequest}
+            isDemo={isDemo}
+            allUsers={allUsers}
           />
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center p-12 text-center bg-slate-50">
@@ -343,41 +382,50 @@ const App: React.FC = () => {
                <ICONS.Chat className="w-16 h-16 text-indigo-500" />
              </div>
              <h2 className="text-3xl font-bold text-slate-800">Welcome, {user.name}</h2>
-             <p className="text-slate-500 mt-4 max-w-sm text-lg">Your professional workspace is ready. Select a contact or join a group to start collaborating.</p>
+             <p className="text-slate-500 mt-4 max-w-sm text-lg">Your workspace is ready. Select a contact or join a group to start collaborating.</p>
+             {isDemo && (
+               <div className="mt-8 p-4 bg-amber-50 border border-amber-100 rounded-2xl text-amber-700 text-sm flex items-center gap-3">
+                 <ICONS.Plus className="w-5 h-5 rotate-45" />
+                 <span>Running in <strong>Demo Mode</strong>. Cloud features disabled.</span>
+               </div>
+             )}
           </div>
         )}
       </main>
 
       {showAddModal === 'dm' && <DMModal allUsers={allUsers.filter(u => u.id !== user.id)} onSelect={createDM} onClose={() => setShowAddModal(null)} />}
-      {showAddModal === 'group' && <GroupModal onJoin={requestJoinGroup} onCreate={createGroup} onClose={() => setShowAddModal(null)} />}
+      {showAddModal === 'group' && <GroupModal onJoin={requestJoinGroup} onCreate={createGroup} onClose={() => setShowAddModal(null)} isDemo={isDemo} conversations={conversations} />}
     </div>
   );
 };
 
-const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage: (t: string) => void, onHandleRequest: (g: string, r: string, a: boolean) => void }> = ({ user, conversation, onSendMessage, onHandleRequest }) => {
+const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage: (t: string) => void, onHandleRequest: (g: string, r: string, a: boolean) => void, isDemo: boolean, allUsers: User[] }> = ({ user, conversation, onSendMessage, onHandleRequest, isDemo, allUsers }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) return;
-    const loadMessages = async () => {
-      try {
-        const { data } = await supabase.from('messages').select('*').eq('conversation_id', conversation.id).order('created_at', { ascending: true });
-        if (data) setMessages(data);
-      } catch (e) { console.error(e); }
-    };
-    loadMessages();
+    if (isDemo) {
+      setMessages(conversation.messages || []);
+    } else if (supabase) {
+      const loadMessages = async () => {
+        try {
+          const { data } = await supabase.from('messages').select('*').eq('conversation_id', conversation.id).order('created_at', { ascending: true });
+          if (data) setMessages(data);
+        } catch (e) { console.error(e); }
+      };
+      loadMessages();
 
-    const channel = supabase.channel(`msgs-${conversation.id}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` }, (payload) => {
-        setMessages(prev => {
-          if (prev.find(m => m.id === payload.new.id)) return prev;
-          return [...prev, payload.new as Message];
-        });
-      })
-      .subscribe();
+      const channel = supabase.channel(`msgs-${conversation.id}`)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` }, (payload) => {
+          setMessages(prev => {
+            if (prev.find(m => m.id === payload.new.id)) return prev;
+            return [...prev, payload.new as Message];
+          });
+        })
+        .subscribe();
 
-    return () => { supabase.removeChannel(channel); };
-  }, [conversation.id]);
+      return () => { supabase.removeChannel(channel); };
+    }
+  }, [conversation.id, conversation.messages, isDemo]);
 
   const participants = conversation.participants || [];
   const pending = participants.filter(p => p.status === 'pending');
@@ -419,14 +467,15 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
         {messages.map((m, idx) => {
           const isMe = m.sender_id === user.id;
           const showHeader = idx === 0 || messages[idx-1].sender_id !== m.sender_id;
+          const sender = allUsers.find(u => u.id === m.sender_id);
 
           return (
             <div key={m.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
               <div className={`flex flex-col max-w-[75%] ${isMe ? 'items-end' : 'items-start'}`}>
-                {showHeader && !isMe && <p className="text-[10px] font-bold text-slate-400 mb-1 ml-1 uppercase tracking-tighter">Sender ID: {m.sender_id}</p>}
+                {showHeader && !isMe && <p className="text-[10px] font-bold text-slate-400 mb-1 ml-1 uppercase tracking-tighter">{sender?.name || m.sender_id}</p>}
                 <div className={`p-4 rounded-2xl shadow-sm border ${isMe ? 'bg-indigo-600 text-white border-indigo-500 rounded-tr-none' : 'bg-white text-slate-800 border-slate-200 rounded-tl-none'}`}>
                   <p className="whitespace-pre-wrap">{m.text}</p>
-                  {m.is_ai && <p className="mt-2 text-[10px] font-bold uppercase tracking-widest opacity-60">Generated by Gemini</p>}
+                  {m.is_ai && <p className="mt-2 text-[10px] font-bold uppercase tracking-widest opacity-60">AI Assistant</p>}
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1 px-1">{new Date(m.created_at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</p>
               </div>
@@ -442,7 +491,7 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
   );
 };
 
-const Login: React.FC<{ onLogin: (name: string) => void }> = ({ onLogin }) => {
+const Login: React.FC<{ onLogin: (name: string) => void, isDemo: boolean }> = ({ onLogin, isDemo }) => {
   const [name, setName] = useState('');
   return (
     <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6">
@@ -450,8 +499,15 @@ const Login: React.FC<{ onLogin: (name: string) => void }> = ({ onLogin }) => {
         <div className="w-16 h-16 bg-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-6">
           <ICONS.Chat className="w-10 h-10 text-white" />
         </div>
-        <h1 className="text-3xl font-bold text-center text-slate-800 mb-2">Pulse Messaging</h1>
-        <p className="text-slate-400 text-center mb-10 font-medium">Professional workspace communication</p>
+        <h1 className="text-3xl font-bold text-center text-slate-800 mb-2">Pulse B-Chat</h1>
+        <p className="text-slate-400 text-center mb-4 font-medium">Communication Workspace</p>
+        
+        {isDemo && (
+          <div className="bg-amber-50 text-amber-700 p-4 rounded-2xl text-xs font-medium mb-8 text-center border border-amber-100">
+            Note: You are entering in <strong>Demo Mode</strong> as Supabase credentials are not detected.
+          </div>
+        )}
+
         <form onSubmit={e => { e.preventDefault(); if(name.trim()) onLogin(name.trim()); }} className="space-y-6">
           <div>
             <label className="block text-sm font-bold text-slate-700 mb-2">Display Name</label>
@@ -487,7 +543,7 @@ const ChatInput: React.FC<{ onSend: (text: string) => void }> = ({ onSend }) => 
         value={text}
         onChange={e => setText(e.target.value)}
         onKeyDown={e => e.key === 'Enter' && submit()}
-        placeholder="Type a professional message..."
+        placeholder="Type a message..."
       />
       <button onClick={submit} className="p-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl shadow-lg shadow-indigo-500/10 transition-all active:scale-95 flex-shrink-0">
         <ICONS.Send className="w-6 h-6" />
@@ -499,7 +555,6 @@ const ChatInput: React.FC<{ onSend: (text: string) => void }> = ({ onSend }) => 
 const DMModal: React.FC<{ allUsers: User[], onSelect: (id: string) => void, onClose: () => void }> = ({ allUsers, onSelect, onClose }) => {
   const [manualId, setManualId] = useState('');
   const [search, setSearch] = useState('');
-  
   const filtered = allUsers.filter(u => u.name.toLowerCase().includes(search.toLowerCase()) || u.id.toLowerCase().includes(search.toLowerCase()));
 
   return (
@@ -511,37 +566,21 @@ const DMModal: React.FC<{ allUsers: User[], onSelect: (id: string) => void, onCl
         </div>
         
         <div className="p-6 space-y-6 overflow-y-auto">
-          {/* Manual ID Entry */}
           <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
-             <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">Enter User ID Directly</label>
+             <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">User ID</label>
              <div className="flex gap-2">
-               <input 
-                 className="flex-1 p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-mono focus:ring-2 focus:ring-indigo-100" 
-                 placeholder="e.g. usr-abc12" 
-                 value={manualId}
-                 onChange={e => setManualId(e.target.value)}
-               />
-               <button 
-                 onClick={() => manualId && onSelect(manualId)}
-                 className="bg-indigo-600 text-white px-4 py-2 rounded-xl font-bold text-sm shadow-sm hover:bg-indigo-700 transition-colors"
-               >
-                 Chat
-               </button>
+               <input className="flex-1 p-3 bg-white border border-slate-200 rounded-xl outline-none text-sm font-mono" placeholder="usr-xyz12" value={manualId} onChange={e => setManualId(e.target.value)} />
+               <button onClick={() => manualId && onSelect(manualId)} className="bg-indigo-600 text-white px-4 py-2 rounded-xl font-bold text-sm shadow-sm hover:bg-indigo-700">Chat</button>
              </div>
           </div>
 
           <div className="relative">
             <ICONS.Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
-            <input 
-              className="w-full pl-12 pr-4 py-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-100" 
-              placeholder="Search user list..." 
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-            />
+            <input className="w-full pl-12 pr-4 py-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-2 focus:ring-indigo-100" placeholder="Search users..." value={search} onChange={e => setSearch(e.target.value)} />
           </div>
 
           <div className="space-y-1">
-            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 px-2">Contacts In Workspace</p>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 px-2">Contacts</p>
             {filtered.map(u => (
               <button key={u.id} onClick={() => onSelect(u.id)} className="w-full flex items-center gap-4 p-4 hover:bg-indigo-50 rounded-2xl transition-all group border border-transparent hover:border-indigo-100">
                 <img src={u.avatar_url} className="w-12 h-12 rounded-full border shadow-sm" />
@@ -559,29 +598,37 @@ const DMModal: React.FC<{ allUsers: User[], onSelect: (id: string) => void, onCl
   );
 };
 
-const GroupModal: React.FC<{ onCreate: (n: string) => void, onJoin: (id: string) => void, onClose: () => void }> = ({ onCreate, onJoin, onClose }) => {
+const GroupModal: React.FC<{ onCreate: (n: string) => void, onJoin: (id: string) => void, onClose: () => void, isDemo: boolean, conversations: Conversation[] }> = ({ onCreate, onJoin, onClose, isDemo, conversations }) => {
   const [name, setName] = useState('');
+  const [tab, setTab] = useState<'create' | 'join'>('create');
+
   return (
     <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-6 z-50">
-      <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl p-8">
-         <h2 className="text-2xl font-bold text-slate-800 mb-6">Create New Group</h2>
-         <div className="space-y-6">
-           <div>
-             <label className="block text-sm font-bold text-slate-700 mb-2">Group Name</label>
-             <input 
-               className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-4 focus:ring-indigo-100 focus:border-indigo-500 transition-all font-medium" 
-               placeholder="e.g. Design Systems" 
-               value={name} 
-               onChange={e => setName(e.target.value)} 
-             />
-           </div>
-           <button 
-             onClick={() => name && onCreate(name)} 
-             className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-2xl shadow-xl shadow-indigo-500/20 transition-all"
-           >
-             Launch Group
-           </button>
-           <button onClick={onClose} className="w-full text-slate-400 font-bold text-sm">Cancel</button>
+      <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl overflow-hidden flex flex-col">
+         <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+           <h2 className="text-2xl font-bold text-slate-800">Groups</h2>
+           <button onClick={onClose} className="p-2 hover:bg-slate-100 rounded-xl transition-colors"><ICONS.X className="w-6 h-6" /></button>
+         </div>
+
+         <div className="flex border-b">
+           <button onClick={() => setTab('create')} className={`flex-1 py-4 text-xs font-bold uppercase tracking-widest ${tab === 'create' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-slate-400'}`}>Create</button>
+           <button onClick={() => setTab('join')} className={`flex-1 py-4 text-xs font-bold uppercase tracking-widest ${tab === 'join' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-slate-400'}`}>Browse</button>
+         </div>
+
+         <div className="p-8">
+           {tab === 'create' ? (
+             <div className="space-y-6">
+               <div>
+                 <label className="block text-sm font-bold text-slate-700 mb-2">Group Name</label>
+                 <input className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:ring-4 focus:ring-indigo-100" placeholder="e.g. Marketing Team" value={name} onChange={e => setName(e.target.value)} />
+               </div>
+               <button onClick={() => name && onCreate(name)} className="w-full py-4 bg-indigo-600 text-white font-bold rounded-2xl shadow-xl shadow-indigo-500/20">Launch Group</button>
+             </div>
+           ) : (
+             <div className="space-y-2 max-h-[40vh] overflow-y-auto">
+               <p className="text-xs text-slate-400 text-center py-8">No public groups found in this workspace yet.</p>
+             </div>
+           )}
          </div>
       </div>
     </div>
