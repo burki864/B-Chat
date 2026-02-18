@@ -1,5 +1,5 @@
-
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+'use client'; // <-- BU SATIRI MUTLAKA EKLE
+import React, { useState, useEffect, useCallback } from 'react';
 import { User, Conversation, Message, Participant } from './types';
 import { ICONS } from './constants';
 import { gemini } from './services/geminiService';
@@ -12,6 +12,7 @@ const App: React.FC = () => {
   const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [isSidebarOpen, setSidebarOpen] = useState(true);
   const [showAddModal, setShowAddModal] = useState<'dm' | 'group' | null>(null);
+  const [selectedProfile, setSelectedProfile] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Demo Mode State (Fallback when Supabase is missing)
@@ -23,10 +24,14 @@ const App: React.FC = () => {
       const storageKey = isDemo ? 'pulse_demo_user' : 'pulse_user_v2';
       const savedUser = localStorage.getItem(storageKey);
       if (savedUser && savedUser !== 'undefined') {
-        setUser(JSON.parse(savedUser));
+        const parsed = JSON.parse(savedUser);
+        if (parsed && parsed.id) {
+          setUser(parsed);
+        }
       }
     } catch (e) {
       console.error("Failed to parse saved user:", e);
+      localStorage.removeItem(isDemo ? 'pulse_demo_user' : 'pulse_user_v2');
     } finally {
       setLoading(false);
     }
@@ -82,8 +87,10 @@ const App: React.FC = () => {
   }, [user, isDemo]);
 
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    if (user) {
+      fetchData();
+    }
+  }, [fetchData, user]);
 
   // Real-time subscriptions (Only for real mode)
   useEffect(() => {
@@ -113,10 +120,14 @@ const App: React.FC = () => {
       setUser(newUser);
       fetchData();
     } else if (supabase) {
-      const { error } = await supabase.from('users').insert([newUser]);
-      if (!error) {
-        setUser(newUser);
-        localStorage.setItem('pulse_user_v2', JSON.stringify(newUser));
+      try {
+        const { error } = await supabase.from('users').insert([newUser]);
+        if (!error) {
+          setUser(newUser);
+          localStorage.setItem('pulse_user_v2', JSON.stringify(newUser));
+        }
+      } catch (e) {
+        console.error("Supabase Login Error:", e);
       }
     }
   };
@@ -320,7 +331,10 @@ const App: React.FC = () => {
         </div>
 
         <div className="p-4 flex-1 overflow-y-auto space-y-6">
-          <div className="flex items-center gap-3 p-3 bg-slate-800 rounded-xl">
+          <div 
+            onClick={() => setSelectedProfile(user)}
+            className="flex items-center gap-3 p-3 bg-slate-800 rounded-xl cursor-pointer hover:bg-slate-700 transition-colors"
+          >
             <img src={user.avatar_url} className="w-10 h-10 rounded-full border-2 border-indigo-500" />
             <div className="flex-1 min-w-0">
               <p className="font-semibold truncate">{user.name}</p>
@@ -375,6 +389,7 @@ const App: React.FC = () => {
             onHandleRequest={handleRequest}
             isDemo={isDemo}
             allUsers={allUsers}
+            onProfileClick={setSelectedProfile}
           />
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center p-12 text-center bg-slate-50">
@@ -395,11 +410,20 @@ const App: React.FC = () => {
 
       {showAddModal === 'dm' && <DMModal allUsers={allUsers.filter(u => u.id !== user.id)} onSelect={createDM} onClose={() => setShowAddModal(null)} />}
       {showAddModal === 'group' && <GroupModal onJoin={requestJoinGroup} onCreate={createGroup} onClose={() => setShowAddModal(null)} isDemo={isDemo} conversations={conversations} />}
+      {selectedProfile && <ProfileModal user={selectedProfile} onClose={() => setSelectedProfile(null)} />}
     </div>
   );
 };
 
-const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage: (t: string) => void, onHandleRequest: (g: string, r: string, a: boolean) => void, isDemo: boolean, allUsers: User[] }> = ({ user, conversation, onSendMessage, onHandleRequest, isDemo, allUsers }) => {
+const ChatView: React.FC<{ 
+  user: User, 
+  conversation: Conversation, 
+  onSendMessage: (t: string) => void, 
+  onHandleRequest: (g: string, r: string, a: boolean) => void, 
+  isDemo: boolean, 
+  allUsers: User[],
+  onProfileClick: (u: User) => void
+}> = ({ user, conversation, onSendMessage, onHandleRequest, isDemo, allUsers, onProfileClick }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   
   useEffect(() => {
@@ -432,17 +456,20 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
   const isAdmin = participants.find(p => p.user_id === user.id)?.is_admin;
   const otherParticipant = conversation.type === 'dm' ? participants.find(p => p.user_id !== user.id) : null;
   const displayName = conversation.type === 'dm' ? (otherParticipant?.user?.name || `User ${otherParticipant?.user_id}`) : conversation.name;
+  
+  const headerUser = otherParticipant?.user || (conversation.type === 'dm' ? { id: otherParticipant?.user_id, name: `User ${otherParticipant?.user_id}`, avatar_url: `https://picsum.photos/seed/${otherParticipant?.user_id}/200` } as User : null);
 
   return (
     <div className="flex flex-col h-full bg-white">
       <header className="h-20 bg-white border-b px-6 flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-4">
           <img 
+            onClick={() => headerUser && onProfileClick(headerUser)}
             src={conversation.type === 'dm' ? (otherParticipant?.user?.avatar_url || `https://picsum.photos/seed/${otherParticipant?.user_id}/200`) : `https://picsum.photos/seed/${conversation.name}/200`}
-            className="w-10 h-10 rounded-full border shadow-sm"
+            className={`w-10 h-10 rounded-full border shadow-sm ${conversation.type === 'dm' ? 'cursor-pointer' : ''}`}
           />
           <div>
-            <h2 className="font-bold text-lg text-slate-800">{displayName}</h2>
+            <h2 className={`font-bold text-lg text-slate-800 ${conversation.type === 'dm' ? 'cursor-pointer hover:text-indigo-600' : ''}`} onClick={() => conversation.type === 'dm' && headerUser && onProfileClick(headerUser)}>{displayName}</h2>
             <p className="text-[10px] text-slate-400 uppercase font-bold tracking-widest">{conversation.type}</p>
           </div>
         </div>
@@ -472,7 +499,14 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
           return (
             <div key={m.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
               <div className={`flex flex-col max-w-[75%] ${isMe ? 'items-end' : 'items-start'}`}>
-                {showHeader && !isMe && <p className="text-[10px] font-bold text-slate-400 mb-1 ml-1 uppercase tracking-tighter">{sender?.name || m.sender_id}</p>}
+                {showHeader && !isMe && (
+                  <p 
+                    onClick={() => sender && onProfileClick(sender)}
+                    className="text-[10px] font-bold text-slate-400 mb-1 ml-1 uppercase tracking-tighter cursor-pointer hover:text-indigo-500 transition-colors"
+                  >
+                    {sender?.name || m.sender_id}
+                  </p>
+                )}
                 <div className={`p-4 rounded-2xl shadow-sm border ${isMe ? 'bg-indigo-600 text-white border-indigo-500 rounded-tr-none' : 'bg-white text-slate-800 border-slate-200 rounded-tl-none'}`}>
                   <p className="whitespace-pre-wrap">{m.text}</p>
                   {m.is_ai && <p className="mt-2 text-[10px] font-bold uppercase tracking-widest opacity-60">AI Assistant</p>}
@@ -490,6 +524,51 @@ const ChatView: React.FC<{ user: User, conversation: Conversation, onSendMessage
     </div>
   );
 };
+
+const ProfileModal: React.FC<{ user: User, onClose: () => void }> = ({ user, onClose }) => (
+  <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-6 z-[60]">
+    <div className="bg-white w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden flex flex-col items-center p-8 relative">
+      <button onClick={onClose} className="absolute right-6 top-6 p-2 hover:bg-slate-100 rounded-xl transition-colors">
+        <ICONS.X className="w-6 h-6 text-slate-400" />
+      </button>
+      
+      <div className="relative mb-6">
+        <img src={user.avatar_url} className="w-32 h-32 rounded-full border-4 border-slate-50 shadow-xl object-cover" />
+        <div className="absolute bottom-1 right-1 w-6 h-6 bg-green-500 border-4 border-white rounded-full"></div>
+      </div>
+      
+      <h3 className="text-2xl font-bold text-slate-800 text-center mb-1">{user.name}</h3>
+      <div className="px-3 py-1 bg-slate-100 rounded-full mb-8">
+        <p className="text-[10px] font-mono font-bold text-slate-500 uppercase tracking-widest">{user.id}</p>
+      </div>
+      
+      <div className="w-full space-y-3">
+        <div className="flex items-center gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-100">
+           <div className="p-3 bg-white rounded-xl shadow-sm"><ICONS.User className="w-5 h-5 text-indigo-500" /></div>
+           <div className="flex-1">
+             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Display Name</p>
+             <p className="font-semibold text-slate-700">{user.name}</p>
+           </div>
+        </div>
+        
+        <div className="flex items-center gap-4 p-4 bg-slate-50 rounded-2xl border border-slate-100">
+           <div className="p-3 bg-white rounded-xl shadow-sm"><ICONS.Search className="w-5 h-5 text-indigo-500" /></div>
+           <div className="flex-1">
+             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Workspace ID</p>
+             <p className="font-mono text-xs text-slate-700">{user.id}</p>
+           </div>
+        </div>
+      </div>
+      
+      <button 
+        onClick={onClose}
+        className="mt-8 w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-2xl shadow-xl shadow-indigo-500/10 transition-all active:scale-95"
+      >
+        Done
+      </button>
+    </div>
+  </div>
+);
 
 const Login: React.FC<{ onLogin: (name: string) => void, isDemo: boolean }> = ({ onLogin, isDemo }) => {
   const [name, setName] = useState('');
